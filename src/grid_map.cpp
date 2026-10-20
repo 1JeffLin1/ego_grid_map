@@ -1,11 +1,19 @@
 #include "plan_env/grid_map.h"
 
+#include <algorithm>
+#include <cmath>
+#include <stdexcept>
+
 // #define current_img_ md_.depth_image_[image_cnt_ & 1]
 // #define last_img_ md_.depth_image_[!(image_cnt_ & 1)]
 
 void GridMap::initMap(ros::NodeHandle &nh)
 {
   node_ = nh;
+
+  node_.param("grid_map/rolling_z", mp_.rolling_z_, false);
+  node_.param("grid_map/obstacle_ttl", mp_.obstacle_ttl_, 1.0);
+  node_.param("grid_map/use_cloud_input", mp_.use_cloud_input_, true);
 
   /* get parameter */
   double x_size, y_size, z_size;
@@ -49,7 +57,21 @@ void GridMap::initMap(ros::NodeHandle &nh)
   node_.param("grid_map/local_map_margin", mp_.local_map_margin_, 1);
   node_.param("grid_map/ground_height", mp_.ground_height_, 1.0);
 
-  mp_.resolution_inv_ = 1 / mp_.resolution_;
+  // Invalid dimensions/resolution would cause allocation or division failures.
+  if (!std::isfinite(mp_.resolution_) || mp_.resolution_ <= 0.0 ||
+      !std::isfinite(x_size) || x_size <= 0.0 ||
+      !std::isfinite(y_size) || y_size <= 0.0 ||
+      !std::isfinite(z_size) || z_size <= 0.0 ||
+      !mp_.local_update_range_.allFinite() ||
+      (mp_.local_update_range_.array() <= 0.0).any() ||
+      !std::isfinite(mp_.obstacles_inflation_) || mp_.obstacles_inflation_ < 0.0 ||
+      !std::isfinite(mp_.obstacle_ttl_) || mp_.obstacle_ttl_ < 0.0)
+  {
+    ROS_FATAL("Invalid GridMap dimensions, resolution, update range, inflation or TTL");
+    throw std::runtime_error("Invalid GridMap configuration");
+  }
+
+  mp_.resolution_inv_ = 1.0 / mp_.resolution_;
   mp_.map_origin_ = Eigen::Vector3d(-x_size / 2.0, -y_size / 2.0, mp_.ground_height_);
   mp_.map_size_ = Eigen::Vector3d(x_size, y_size, z_size);
 
@@ -69,6 +91,12 @@ void GridMap::initMap(ros::NodeHandle &nh)
   for (int i = 0; i < 3; ++i)
     mp_.map_voxel_num_(i) = ceil(mp_.map_size_(i) / mp_.resolution_);
 
+  // Align map dimensions to integer voxel counts.
+  mp_.map_size_ = mp_.map_voxel_num_.cast<double>() * mp_.resolution_;
+  // Center XY around world origin initially; Z remains ground-aligned until rolling_z is enabled.
+  mp_.map_origin_.x() = -0.5 * mp_.map_size_.x();
+  mp_.map_origin_.y() = -0.5 * mp_.map_size_.y();
+
   mp_.map_min_boundary_ = mp_.map_origin_;
   mp_.map_max_boundary_ = mp_.map_origin_ + mp_.map_size_;
 
@@ -78,6 +106,10 @@ void GridMap::initMap(ros::NodeHandle &nh)
 
   md_.occupancy_buffer_ = vector<double>(buffer_size, mp_.clamp_min_log_ - mp_.unknown_flag_);
   md_.occupancy_buffer_inflate_ = vector<char>(buffer_size, 0);
+
+  md_.last_seen_time_ = std::vector<double>(buffer_size, -1.0);  // -1 = unobserved
+  md_.local_bound_min_.setZero();
+  md_.local_bound_max_ = mp_.map_voxel_num_ - Eigen::Vector3i::Ones();
 
   md_.count_hit_and_miss_ = vector<short>(buffer_size, 0);
   md_.count_hit_ = vector<short>(buffer_size, 0);
@@ -93,35 +125,37 @@ void GridMap::initMap(ros::NodeHandle &nh)
       0.0, -1.0, 0.0, -0.02,
       0.0, 0.0, 0.0, 1.0;
 
-  /* init callback */
-
-  //depth_sub_.reset(new message_filters::Subscriber<sensor_msgs::Image>(node_, "/grid_map/depth", 50));
-  depth_sub_.reset(new message_filters::Subscriber<sensor_msgs::Image>(node_, "/camera/aligned_depth_to_color/image_raw", 50));
-
-  if (mp_.pose_type_ == POSE_STAMPED)
+  /* init callbacks: cloud and depth are mutually exclusive input modes. */
+  if (!mp_.use_cloud_input_)
   {
-    pose_sub_.reset(
-        new message_filters::Subscriber<geometry_msgs::PoseStamped>(node_, "/grid_map/pose", 25));
+    depth_sub_.reset(new message_filters::Subscriber<sensor_msgs::Image>(
+        node_, "/camera/aligned_depth_to_color/image_raw", 50));
 
-    sync_image_pose_.reset(new message_filters::Synchronizer<SyncPolicyImagePose>(
-        SyncPolicyImagePose(100), *depth_sub_, *pose_sub_));
-    sync_image_pose_->registerCallback(boost::bind(&GridMap::depthPoseCallback, this, _1, _2));
+    if (mp_.pose_type_ == POSE_STAMPED)
+    {
+      pose_sub_.reset(new message_filters::Subscriber<geometry_msgs::PoseStamped>(
+          node_, "/grid_map/pose", 25));
+      sync_image_pose_.reset(new message_filters::Synchronizer<SyncPolicyImagePose>(
+          SyncPolicyImagePose(100), *depth_sub_, *pose_sub_));
+      sync_image_pose_->registerCallback(boost::bind(&GridMap::depthPoseCallback, this, _1, _2));
+    }
+    else if (mp_.pose_type_ == ODOMETRY)
+    {
+      odom_sub_.reset(new message_filters::Subscriber<nav_msgs::Odometry>(
+          node_, "/vins_estimator/imu_propagate", 100));
+      sync_image_odom_.reset(new message_filters::Synchronizer<SyncPolicyImageOdom>(
+          SyncPolicyImageOdom(100), *depth_sub_, *odom_sub_));
+      sync_image_odom_->registerCallback(boost::bind(&GridMap::depthOdomCallback, this, _1, _2));
+    }
   }
-  else if (mp_.pose_type_ == ODOMETRY)
+  else
   {
-    //odom_sub_.reset(new message_filters::Subscriber<nav_msgs::Odometry>(node_, "/grid_map/odom", 100));
-    odom_sub_.reset(new message_filters::Subscriber<nav_msgs::Odometry>(node_, "/vins_estimator/imu_propagate", 100));
-
-    sync_image_odom_.reset(new message_filters::Synchronizer<SyncPolicyImageOdom>(
-        SyncPolicyImageOdom(100), *depth_sub_, *odom_sub_));
-    sync_image_odom_->registerCallback(boost::bind(&GridMap::depthOdomCallback, this, _1, _2));
+    // The absolute names are remapped by grid_map.launch to FAST-LIO2 topics.
+    indep_cloud_sub_ = node_.subscribe<sensor_msgs::PointCloud2>(
+        "/grid_map/cloud", 10, &GridMap::cloudCallback, this);
+    indep_odom_sub_ = node_.subscribe<nav_msgs::Odometry>(
+        "/grid_map/odom", 10, &GridMap::odomCallback, this);
   }
-
-  // use odometry and point cloud
-  indep_cloud_sub_ =
-      node_.subscribe<sensor_msgs::PointCloud2>("/grid_map/cloud", 10, &GridMap::cloudCallback, this);
-  indep_odom_sub_ =
-      node_.subscribe<nav_msgs::Odometry>("/grid_map/odom", 10, &GridMap::odomCallback, this);
 
   occ_timer_ = node_.createTimer(ros::Duration(0.05), &GridMap::updateOccupancyCallback, this);
   vis_timer_ = node_.createTimer(ros::Duration(0.05), &GridMap::visCallback, this);
@@ -622,13 +656,8 @@ void GridMap::clearAndInflateLocalMap()
           for (int k = 0; k < (int)inf_pts.size(); ++k)
           {
             inf_pt = inf_pts[k];
-            int idx_inf = toAddress(inf_pt);
-            if (idx_inf < 0 ||
-                idx_inf >= mp_.map_voxel_num_(0) * mp_.map_voxel_num_(1) * mp_.map_voxel_num_(2))
-            {
-              continue;
-            }
-            md_.occupancy_buffer_inflate_[idx_inf] = 1;
+            if (!isInMap(inf_pt)) continue;
+            md_.occupancy_buffer_inflate_[toAddress(inf_pt)] = 1;
           }
         }
       }
@@ -637,16 +666,21 @@ void GridMap::clearAndInflateLocalMap()
   if (mp_.virtual_ceil_height_ > -0.5)
   {
     int ceil_id = floor((mp_.virtual_ceil_height_ - mp_.map_origin_(2)) * mp_.resolution_inv_);
-    for (int x = md_.local_bound_min_(0); x <= md_.local_bound_max_(0); ++x)
-      for (int y = md_.local_bound_min_(1); y <= md_.local_bound_max_(1); ++y)
-      {
-        md_.occupancy_buffer_inflate_[toAddress(x, y, ceil_id)] = 1;
-      }
+    if (ceil_id >= 0 && ceil_id < mp_.map_voxel_num_.z())
+      for (int x = md_.local_bound_min_(0); x <= md_.local_bound_max_(0); ++x)
+        for (int y = md_.local_bound_min_(1); y <= md_.local_bound_max_(1); ++y)
+          md_.occupancy_buffer_inflate_[toAddress(x, y, ceil_id)] = 1;
   }
 }
 
 void GridMap::visCallback(const ros::TimerEvent & /*event*/)
 {
+  if (mp_.use_cloud_input_)
+  {
+    if (!md_.has_cloud_) return;
+    if (expireRollingObstacles(ros::Time::now().toSec()))
+      rebuildInflatedMap();
+  }
 
   publishMap();
   publishMapInflate(true);
@@ -717,115 +751,198 @@ void GridMap::depthPoseCallback(const sensor_msgs::ImageConstPtr &img,
     md_.occ_need_update_ = false;
   }
 }
-void GridMap::odomCallback(const nav_msgs::OdometryConstPtr &odom)
+// In the cloud-only mode, only the raw measured voxels carry timestamps.
+// The inflated occupancy buffer is always rebuilt from these raw voxels.
+void GridMap::moveRollingMap(const Eigen::Vector3d& center)
 {
-  if (md_.has_first_depth_)
-    return;
+  Eigen::Vector3d desired = mp_.map_origin_;
+  desired.x() = center.x() - 0.5 * mp_.map_size_.x();
+  desired.y() = center.y() - 0.5 * mp_.map_size_.y();
+  if (mp_.rolling_z_)
+    desired.z() = center.z() - 0.5 * mp_.map_size_.z();
 
-  md_.camera_pos_(0) = odom->pose.pose.position.x;
-  md_.camera_pos_(1) = odom->pose.pose.position.y;
-  md_.camera_pos_(2) = odom->pose.pose.position.z;
+  Eigen::Vector3i shift;
+  for (int a = 0; a < 3; ++a)
+    shift[a] = static_cast<int>(std::round(
+        (desired[a] - mp_.map_origin_[a]) * mp_.resolution_inv_));
 
-  md_.has_odom_ = true;
+  if (shift.isZero()) return;
+
+  const Eigen::Vector3i n = mp_.map_voxel_num_;
+  const size_t count = md_.occupancy_buffer_.size();
+  const double unknown = mp_.clamp_min_log_ - mp_.unknown_flag_;
+
+  std::vector<double> next_occ(count, unknown);
+  std::vector<char> next_inflated(count, 0);
+  std::vector<double> next_seen(count, -1.0);
+
+  // A large movement has no overlap: simply initialize an empty map.
+  if ((shift.array().abs() < n.array()).all())
+  {
+    for (int x = 0; x < n.x(); ++x)
+      for (int y = 0; y < n.y(); ++y)
+        for (int z = 0; z < n.z(); ++z)
+        {
+          const Eigen::Vector3i old_id(
+              x + shift.x(), y + shift.y(), z + shift.z());
+          if (!isInMap(old_id)) continue;
+
+          const Eigen::Vector3i new_id(x, y, z);
+          const int dst = toAddress(new_id);
+          const int from = toAddress(old_id);
+          next_occ[dst] = md_.occupancy_buffer_[from];
+          next_inflated[dst] = md_.occupancy_buffer_inflate_[from];
+          next_seen[dst] = md_.last_seen_time_[from];
+        }
+  }
+
+  md_.occupancy_buffer_.swap(next_occ);
+  md_.occupancy_buffer_inflate_.swap(next_inflated);
+  md_.last_seen_time_.swap(next_seen);
+
+  // Exact voxel shift preserves the position of stored obstacles in World Frame.
+  mp_.map_origin_ += shift.cast<double>() * mp_.resolution_;
+  mp_.map_min_boundary_ = mp_.map_origin_;
+  mp_.map_max_boundary_ = mp_.map_origin_ + mp_.map_size_;
+  md_.local_bound_min_.setZero();
+  md_.local_bound_max_ = n - Eigen::Vector3i::Ones();
 }
 
-void GridMap::cloudCallback(const sensor_msgs::PointCloud2ConstPtr &img)
+bool GridMap::expireRollingObstacles(double now)
 {
+  if (mp_.obstacle_ttl_ <= 0.0 || !std::isfinite(now)) return false;
 
-  pcl::PointCloud<pcl::PointXYZ> latest_cloud;
-  pcl::fromROSMsg(*img, latest_cloud);
-
-  md_.has_cloud_ = true;
-
-  if (!md_.has_odom_)
+  bool changed = false;
+  const double unknown = mp_.clamp_min_log_ - mp_.unknown_flag_;
+  for (size_t i = 0; i < md_.last_seen_time_.size(); ++i)
   {
-    std::cout << "no odom!" << std::endl;
-    return;
-  }
+    const double last = md_.last_seen_time_[i];
+    if (last < 0.0) continue;
 
-  if (latest_cloud.points.size() == 0)
-    return;
-
-  if (isnan(md_.camera_pos_(0)) || isnan(md_.camera_pos_(1)) || isnan(md_.camera_pos_(2)))
-    return;
-
-  this->resetBuffer(md_.camera_pos_ - mp_.local_update_range_,
-                    md_.camera_pos_ + mp_.local_update_range_);
-
-  pcl::PointXYZ pt;
-  Eigen::Vector3d p3d, p3d_inf;
-
-  int inf_step = ceil(mp_.obstacles_inflation_ / mp_.resolution_);
-  int inf_step_z = 1;
-
-  double max_x, max_y, max_z, min_x, min_y, min_z;
-
-  min_x = mp_.map_max_boundary_(0);
-  min_y = mp_.map_max_boundary_(1);
-  min_z = mp_.map_max_boundary_(2);
-
-  max_x = mp_.map_min_boundary_(0);
-  max_y = mp_.map_min_boundary_(1);
-  max_z = mp_.map_min_boundary_(2);
-
-  for (size_t i = 0; i < latest_cloud.points.size(); ++i)
-  {
-    pt = latest_cloud.points[i];
-    p3d(0) = pt.x, p3d(1) = pt.y, p3d(2) = pt.z;
-
-    /* point inside update range */
-    Eigen::Vector3d devi = p3d - md_.camera_pos_;
-    Eigen::Vector3i inf_pt;
-
-    if (fabs(devi(0)) < mp_.local_update_range_(0) && fabs(devi(1)) < mp_.local_update_range_(1) &&
-        fabs(devi(2)) < mp_.local_update_range_(2))
+    // Handle both normal expiration and ROS simulated-time reset.
+    if (now < last || now - last > mp_.obstacle_ttl_)
     {
-
-      /* inflate the point */
-      for (int x = -inf_step; x <= inf_step; ++x)
-        for (int y = -inf_step; y <= inf_step; ++y)
-          for (int z = -inf_step_z; z <= inf_step_z; ++z)
-          {
-
-            p3d_inf(0) = pt.x + x * mp_.resolution_;
-            p3d_inf(1) = pt.y + y * mp_.resolution_;
-            p3d_inf(2) = pt.z + z * mp_.resolution_;
-
-            max_x = max(max_x, p3d_inf(0));
-            max_y = max(max_y, p3d_inf(1));
-            max_z = max(max_z, p3d_inf(2));
-
-            min_x = min(min_x, p3d_inf(0));
-            min_y = min(min_y, p3d_inf(1));
-            min_z = min(min_z, p3d_inf(2));
-
-            posToIndex(p3d_inf, inf_pt);
-
-            if (!isInMap(inf_pt))
-              continue;
-
-            int idx_inf = toAddress(inf_pt);
-
-            md_.occupancy_buffer_inflate_[idx_inf] = 1;
-          }
+      md_.last_seen_time_[i] = -1.0;
+      md_.occupancy_buffer_[i] = unknown;
+      changed = true;
     }
   }
+  return changed;
+}
 
-  min_x = min(min_x, md_.camera_pos_(0));
-  min_y = min(min_y, md_.camera_pos_(1));
-  min_z = min(min_z, md_.camera_pos_(2));
+void GridMap::rebuildInflatedMap()
+{
+  // Rebuild from active raw points: expiring one point must not erase the
+  // inflation region still required by another, non-expired point.
+  std::fill(md_.occupancy_buffer_inflate_.begin(),
+            md_.occupancy_buffer_inflate_.end(), 0);
 
-  max_x = max(max_x, md_.camera_pos_(0));
-  max_y = max(max_y, md_.camera_pos_(1));
-  max_z = max(max_z, md_.camera_pos_(2));
+  const Eigen::Vector3i n = mp_.map_voxel_num_;
+  const int inf_xy = std::max(0, static_cast<int>(
+      std::ceil(mp_.obstacles_inflation_ * mp_.resolution_inv_)));
+  const int inf_z = 1;  // Matches the original LiDAR cloud-only implementation.
 
-  max_z = max(max_z, mp_.ground_height_);
+  for (int x = 0; x < n.x(); ++x)
+    for (int y = 0; y < n.y(); ++y)
+      for (int z = 0; z < n.z(); ++z)
+      {
+        const Eigen::Vector3i center(x, y, z);
+        const int src = toAddress(center);
+        if (md_.last_seen_time_[src] < 0.0 ||
+            md_.occupancy_buffer_[src] < mp_.min_occupancy_log_)
+          continue;
 
-  posToIndex(Eigen::Vector3d(max_x, max_y, max_z), md_.local_bound_max_);
-  posToIndex(Eigen::Vector3d(min_x, min_y, min_z), md_.local_bound_min_);
+        for (int dx = -inf_xy; dx <= inf_xy; ++dx)
+          for (int dy = -inf_xy; dy <= inf_xy; ++dy)
+            for (int dz = -inf_z; dz <= inf_z; ++dz)
+            {
+              const Eigen::Vector3i id = center + Eigen::Vector3i(dx, dy, dz);
+              if (!isInMap(id)) continue;
+              md_.occupancy_buffer_inflate_[toAddress(id)] = 1;
+            }
+      }
+}
 
-  boundIndex(md_.local_bound_min_);
-  boundIndex(md_.local_bound_max_);
+void GridMap::odomCallback(const nav_msgs::OdometryConstPtr &odom)
+{
+  if (!mp_.use_cloud_input_ || md_.has_first_depth_) return;
+
+  // No TF transform is performed by this class: input frames must agree.
+  if (!odom->header.frame_id.empty() &&
+      odom->header.frame_id != mp_.frame_id_)
+  {
+    ROS_ERROR_THROTTLE(5.0, "GridMap odom frame '%s' != map frame '%s'",
+                       odom->header.frame_id.c_str(), mp_.frame_id_.c_str());
+    return;
+  }
+
+  md_.camera_pos_ = Eigen::Vector3d(
+      odom->pose.pose.position.x,
+      odom->pose.pose.position.y,
+      odom->pose.pose.position.z);
+  md_.has_odom_ = md_.camera_pos_.allFinite();
+}
+
+void GridMap::cloudCallback(const sensor_msgs::PointCloud2ConstPtr &msg)
+{
+  if (!mp_.use_cloud_input_) return;
+  if (!md_.has_odom_)
+  {
+    ROS_WARN_THROTTLE(1.0, "GridMap: waiting for valid odometry");
+    return;
+  }
+
+  if (!msg->header.frame_id.empty() &&
+      msg->header.frame_id != mp_.frame_id_)
+  {
+    ROS_ERROR_THROTTLE(5.0, "GridMap cloud frame '%s' != map frame '%s'",
+                       msg->header.frame_id.c_str(), mp_.frame_id_.c_str());
+    return;
+  }
+
+  if (!mp_.rolling_z_ &&
+      (md_.camera_pos_.z() < mp_.map_min_boundary_.z() ||
+       md_.camera_pos_.z() >= mp_.map_max_boundary_.z()))
+  {
+    ROS_WARN_THROTTLE(2.0,
+        "UAV Z is outside the fixed vertical GridMap range; consider rolling_z=true");
+  }
+
+  // Input is assumed to be a world-aligned registered scan, not a body-frame scan.
+  pcl::PointCloud<pcl::PointXYZ> cloud;
+  pcl::fromROSMsg(*msg, cloud);
+  if (cloud.empty()) return;
+
+  moveRollingMap(md_.camera_pos_);
+  const double now = ros::Time::now().toSec();
+  expireRollingObstacles(now);
+
+  for (const auto& pt : cloud.points)
+  {
+    if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z))
+      continue;
+
+    const Eigen::Vector3d p(pt.x, pt.y, pt.z);
+    if (((p - md_.camera_pos_).cwiseAbs().array() >=
+         mp_.local_update_range_.array()).any())
+      continue;
+
+    Eigen::Vector3i id;
+    posToIndex(p, id);
+    if (!isInMap(id)) continue;
+
+    const int addr = toAddress(id);
+    md_.occupancy_buffer_[addr] = mp_.clamp_max_log_;
+    md_.last_seen_time_[addr] = now;
+  }
+
+  rebuildInflatedMap();
+  md_.has_cloud_ = true;
+  md_.local_bound_min_.setZero();
+  md_.local_bound_max_ = mp_.map_voxel_num_ - Eigen::Vector3i::Ones();
+
+  ROS_INFO_THROTTLE(1.0, "Rolling GridMap origin [%.2f, %.2f, %.2f]",
+                    mp_.map_origin_.x(), mp_.map_origin_.y(), mp_.map_origin_.z());
 }
 
 void GridMap::publishMap()
@@ -871,6 +988,8 @@ void GridMap::publishMap()
   sensor_msgs::PointCloud2 cloud_msg;
 
   pcl::toROSMsg(cloud, cloud_msg);
+  cloud_msg.header.frame_id = mp_.frame_id_;
+  cloud_msg.header.stamp = ros::Time::now();
   map_pub_.publish(cloud_msg);
 }
 
@@ -921,6 +1040,8 @@ void GridMap::publishMapInflate(bool all_info)
   sensor_msgs::PointCloud2 cloud_msg;
 
   pcl::toROSMsg(cloud, cloud_msg);
+  cloud_msg.header.frame_id = mp_.frame_id_;
+  cloud_msg.header.stamp = ros::Time::now();
   map_inf_pub_.publish(cloud_msg);
 
   // ROS_INFO("pub map");

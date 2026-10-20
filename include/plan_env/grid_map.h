@@ -45,6 +45,10 @@ struct matrix_hash : std::unary_function<T, size_t> {
 
 struct MappingParameters {
 
+  // Rolling Grid parameters
+  bool rolling_z_;
+  double obstacle_ttl_;
+
   /* map properties */
   Eigen::Vector3d map_origin_, map_size_;
   Eigen::Vector3d map_min_boundary_, map_max_boundary_;  // map range in pos
@@ -54,6 +58,7 @@ struct MappingParameters {
   double obstacles_inflation_;
   string frame_id_;
   int pose_type_;
+  bool use_cloud_input_;
 
   /* camera parameters */
   double cx_, cy_, fx_, fy_;
@@ -89,6 +94,9 @@ struct MappingData {
 
   std::vector<double> occupancy_buffer_;
   std::vector<char> occupancy_buffer_inflate_;
+
+  // Last observed time of each occupied/inflated voxel
+  std::vector<double> last_seen_time_;
 
   // camera position and pose data
 
@@ -182,8 +190,13 @@ public:
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
 private:
+  void rebuildInflatedMap();
+  bool expireRollingObstacles(double now);
   MappingParameters mp_;
   MappingData md_;
+
+  // Rolling map management
+  void moveRollingMap(const Eigen::Vector3d& center);
 
   // get depth image and camera pose
   void depthPoseCallback(const sensor_msgs::ImageConstPtr& img,
