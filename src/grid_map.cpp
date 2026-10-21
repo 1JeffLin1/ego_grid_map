@@ -183,6 +183,87 @@ void GridMap::initMap(ros::NodeHandle &nh)
   // eng_ = default_random_engine(rd());
 }
 
+void GridMap::notifyPackedMap()
+{
+    if (packed_map_callback_)
+    {
+        PackedCollisionGrid packed = exportPackedMap();
+        packed_map_callback_(packed);
+    }
+}
+
+PackedCollisionGrid GridMap::exportPackedMap()
+{
+    PackedCollisionGrid out;
+
+    out.dimensions = mp_.map_voxel_num_;
+    out.resolution = mp_.resolution_;
+
+    // 以地圖更新時的 UAV 位置作為 Local Origin
+    out.anchor_world = md_.camera_pos_;
+    out.origin_local = mp_.map_origin_ - out.anchor_world;
+
+    const int Nx = out.dimensions.x();
+    const int Ny = out.dimensions.y();
+    const int Nz = out.dimensions.z();
+
+    const size_t total =
+        static_cast<size_t>(Nx) * Ny * Nz;
+
+    // 4 voxels / byte
+    out.data.assign((total + 3) / 4, 0);
+
+    for (int x = 0; x < Nx; ++x)
+    {
+        for (int y = 0; y < Ny; ++y)
+        {
+            for (int z = 0; z < Nz; ++z)
+            {
+                Eigen::Vector3i logical_id(x, y, z);
+
+                // Circular Buffer 的實際儲存位址
+                const int physical_addr =
+                    toAddress(logical_id);
+
+                const double occ =
+                    md_.occupancy_buffer_[physical_addr];
+
+                const bool inflated =
+                    md_.occupancy_buffer_inflate_[physical_addr] != 0;
+
+                uint8_t state = 0; // Unknown
+
+                if (occ >= mp_.min_occupancy_log_)
+                {
+                    state = 2; // Occupied
+                }
+                else if (inflated)
+                {
+                    state = 3; // Inflated
+                }
+                else if (occ >= mp_.clamp_min_log_)
+                {
+                    state = 1; // Free
+                }
+
+                // Logical Address
+                const size_t logical_addr =
+                    (static_cast<size_t>(x) * Ny + y) * Nz + z;
+
+                // 2-bit Packing
+                const size_t byte_idx = logical_addr >> 2;
+                const int bit_shift =
+                    2 * static_cast<int>(logical_addr & 3u);
+
+                out.data[byte_idx] |=
+                    static_cast<uint8_t>(state << bit_shift);
+            }
+        }
+    }
+
+    return out;
+}
+
 void GridMap::resetBuffer()
 {
   Eigen::Vector3d min_pos = mp_.map_min_boundary_;
@@ -680,7 +761,10 @@ void GridMap::visCallback(const ros::TimerEvent & /*event*/)
   {
     if (!md_.has_cloud_) return;
     if (expireRollingObstacles(ros::Time::now().toSec()))
+    {
       rebuildInflatedMap();
+      notifyPackedMap();
+    }
   }
 
   publishMap();
@@ -838,6 +922,7 @@ void GridMap::moveRollingMap(const Eigen::Vector3d& center)
   md_.local_bound_min_.setZero();
   md_.local_bound_max_ = n - Eigen::Vector3i::Ones();
 }
+
 bool GridMap::expireRollingObstacles(double now)
 {
   if (mp_.obstacle_ttl_ <= 0.0 || !std::isfinite(now)) return false;
@@ -968,6 +1053,7 @@ void GridMap::cloudCallback(const sensor_msgs::PointCloud2ConstPtr &msg)
 
   rebuildInflatedMap();
   md_.has_cloud_ = true;
+  notifyPackedMap();
   md_.local_bound_min_.setZero();
   md_.local_bound_max_ = mp_.map_voxel_num_ - Eigen::Vector3i::Ones();
 

@@ -12,6 +12,9 @@
 #include <ros/ros.h>
 #include <tuple>
 #include <visualization_msgs/Marker.h>
+#include <cstdint>
+#include <functional>
+#include <vector>
 
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
@@ -27,6 +30,16 @@
 #define logit(x) (log((x) / (1 - (x))))
 
 using namespace std;
+
+struct PackedCollisionGrid
+{
+    Eigen::Vector3i dimensions;
+    Eigen::Vector3d origin_local;
+    Eigen::Vector3d anchor_world;
+
+    double resolution = 0.0;
+    std::vector<uint8_t> data;
+};
 
 // voxel hashing
 template <typename T>
@@ -169,7 +182,12 @@ public:
   inline bool isUnknown(const Eigen::Vector3d& pos);
   inline bool isKnownFree(const Eigen::Vector3i& id);
   inline bool isKnownOccupied(const Eigen::Vector3i& id);
+  PackedCollisionGrid exportPackedMap();
 
+  void setPackedMapCallback(std::function<void(const PackedCollisionGrid&)> cb)
+  {
+    packed_map_callback_ = cb;
+  }
   void initMap(ros::NodeHandle& nh);
 
   void publishMap();
@@ -215,6 +233,10 @@ private:
   void projectDepthImage();
   void raycastProcess();
   void clearAndInflateLocalMap();
+
+  //
+  std::function<void(const PackedCollisionGrid&)> packed_map_callback_;
+  void notifyPackedMap();
 
   inline void inflatePoint(const Eigen::Vector3i& pt, int step, vector<Eigen::Vector3i>& pts);
   int setCacheOccupancy(Eigen::Vector3d pos, int occ);
