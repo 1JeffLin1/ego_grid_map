@@ -108,6 +108,7 @@ void GridMap::initMap(ros::NodeHandle &nh)
   md_.occupancy_buffer_inflate_ = vector<char>(buffer_size, 0);
 
   md_.last_seen_time_ = std::vector<double>(buffer_size, -1.0);  // -1 = unobserved
+  ring_offset_.setZero();  // logical voxel [0,0,0] is initially stored at physical [0,0,0]
   md_.local_bound_min_.setZero();
   md_.local_bound_max_ = mp_.map_voxel_num_ - Eigen::Vector3i::Ones();
 
@@ -755,6 +756,8 @@ void GridMap::depthPoseCallback(const sensor_msgs::ImageConstPtr &img,
 // The inflated occupancy buffer is always rebuilt from these raw voxels.
 void GridMap::moveRollingMap(const Eigen::Vector3d& center)
 {
+  // The logical map still uses a world-aligned origin and local voxel indices.
+  // Only the mapping logical_index -> physical_buffer_address is circular.
   Eigen::Vector3d desired = mp_.map_origin_;
   desired.x() = center.x() - 0.5 * mp_.map_size_.x();
   desired.y() = center.y() - 0.5 * mp_.map_size_.y();
@@ -765,49 +768,76 @@ void GridMap::moveRollingMap(const Eigen::Vector3d& center)
   for (int a = 0; a < 3; ++a)
     shift[a] = static_cast<int>(std::round(
         (desired[a] - mp_.map_origin_[a]) * mp_.resolution_inv_));
-
   if (shift.isZero()) return;
 
   const Eigen::Vector3i n = mp_.map_voxel_num_;
-  const size_t count = md_.occupancy_buffer_.size();
   const double unknown = mp_.clamp_min_log_ - mp_.unknown_flag_;
 
-  std::vector<double> next_occ(count, unknown);
-  std::vector<char> next_inflated(count, 0);
-  std::vector<double> next_seen(count, -1.0);
-
-  // A large movement has no overlap: simply initialize an empty map.
-  if ((shift.array().abs() < n.array()).all())
+  // A jump by >= the extent of any dimension leaves no overlapping voxels.
+  if ((shift.array().abs() >= n.array()).any())
   {
-    for (int x = 0; x < n.x(); ++x)
-      for (int y = 0; y < n.y(); ++y)
-        for (int z = 0; z < n.z(); ++z)
-        {
-          const Eigen::Vector3i old_id(
-              x + shift.x(), y + shift.y(), z + shift.z());
-          if (!isInMap(old_id)) continue;
+    ring_offset_.setZero();
+    std::fill(md_.occupancy_buffer_.begin(), md_.occupancy_buffer_.end(), unknown);
+    std::fill(md_.occupancy_buffer_inflate_.begin(), md_.occupancy_buffer_inflate_.end(), 0);
+    std::fill(md_.last_seen_time_.begin(), md_.last_seen_time_.end(), -1.0);
+    // Ancillary raycasting buffers are cleared too; depth mode is not rolled.
+    std::fill(md_.count_hit_.begin(), md_.count_hit_.end(), 0);
+    std::fill(md_.count_hit_and_miss_.begin(), md_.count_hit_and_miss_.end(), 0);
+    std::fill(md_.flag_rayend_.begin(), md_.flag_rayend_.end(), -1);
+    std::fill(md_.flag_traverse_.begin(), md_.flag_traverse_.end(), -1);
+  }
+  else
+  {
+    // Invariant: physical(old_idx) == physical(new_idx), where
+    // old_idx = new_idx + shift. No old voxel needs to be copied.
+    for (int a = 0; a < 3; ++a)
+    {
+      ring_offset_[a] = (ring_offset_[a] + shift[a]) % n[a];
+      if (ring_offset_[a] < 0) ring_offset_[a] += n[a];
+    }
 
-          const Eigen::Vector3i new_id(x, y, z);
-          const int dst = toAddress(new_id);
-          const int from = toAddress(old_id);
-          next_occ[dst] = md_.occupancy_buffer_[from];
-          next_inflated[dst] = md_.occupancy_buffer_inflate_[from];
-          next_seen[dst] = md_.last_seen_time_[from];
-        }
+    // Clear only the slabs entering the new map (the union over shifted axes).
+    // After the offset update, toAddress() points to the reclaimed physical slots.
+    const auto clearVoxel = [&](const Eigen::Vector3i& logical_id)
+    {
+      const int addr = toAddress(logical_id);
+      md_.occupancy_buffer_[addr] = unknown;
+      md_.occupancy_buffer_inflate_[addr] = 0;
+      md_.last_seen_time_[addr] = -1.0;
+      md_.count_hit_[addr] = 0;
+      md_.count_hit_and_miss_[addr] = 0;
+      md_.flag_rayend_[addr] = -1;
+      md_.flag_traverse_[addr] = -1;
+    };
+
+    for (int axis = 0; axis < 3; ++axis)
+    {
+      if (shift[axis] == 0) continue;
+      // Positive origin shift: new logical indices [n-shift, n-1] entered.
+      // Negative origin shift: new logical indices [0, -shift-1] entered.
+      const int begin = shift[axis] > 0 ? n[axis] - shift[axis] : 0;
+      const int finish = shift[axis] > 0 ? n[axis] : -shift[axis];
+      const int other1 = (axis + 1) % 3;
+      const int other2 = (axis + 2) % 3;
+      for (int a = begin; a < finish; ++a)
+        for (int b = 0; b < n[other1]; ++b)
+          for (int c = 0; c < n[other2]; ++c)
+          {
+            Eigen::Vector3i logical_id;
+            logical_id[axis] = a;
+            logical_id[other1] = b;
+            logical_id[other2] = c;
+            clearVoxel(logical_id);
+          }
+    }
   }
 
-  md_.occupancy_buffer_.swap(next_occ);
-  md_.occupancy_buffer_inflate_.swap(next_inflated);
-  md_.last_seen_time_.swap(next_seen);
-
-  // Exact voxel shift preserves the position of stored obstacles in World Frame.
   mp_.map_origin_ += shift.cast<double>() * mp_.resolution_;
   mp_.map_min_boundary_ = mp_.map_origin_;
   mp_.map_max_boundary_ = mp_.map_origin_ + mp_.map_size_;
   md_.local_bound_min_.setZero();
   md_.local_bound_max_ = n - Eigen::Vector3i::Ones();
 }
-
 bool GridMap::expireRollingObstacles(double now)
 {
   if (mp_.obstacle_ttl_ <= 0.0 || !std::isfinite(now)) return false;

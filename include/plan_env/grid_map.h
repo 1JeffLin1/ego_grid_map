@@ -194,6 +194,8 @@ private:
   bool expireRollingObstacles(double now);
   MappingParameters mp_;
   MappingData md_;
+  // Physical array offset of logical voxel [0,0,0].
+  Eigen::Vector3i ring_offset_ = Eigen::Vector3i::Zero();
 
   // Rolling map management
   void moveRollingMap(const Eigen::Vector3d& center);
@@ -250,12 +252,17 @@ private:
 /* ============================== definition of inline function
  * ============================== */
 
+// Logical indices stay in [0,N); physical addresses wrap at ring_offset_.
 inline int GridMap::toAddress(const Eigen::Vector3i& id) {
-  return id(0) * mp_.map_voxel_num_(1) * mp_.map_voxel_num_(2) + id(1) * mp_.map_voxel_num_(2) + id(2);
+  const Eigen::Vector3i& n = mp_.map_voxel_num_;
+  const int px = (id.x() + ring_offset_.x()) % n.x();
+  const int py = (id.y() + ring_offset_.y()) % n.y();
+  const int pz = (id.z() + ring_offset_.z()) % n.z();
+  return px * n.y() * n.z() + py * n.z() + pz;
 }
 
 inline int GridMap::toAddress(int& x, int& y, int& z) {
-  return x * mp_.map_voxel_num_(1) * mp_.map_voxel_num_(2) + y * mp_.map_voxel_num_(2) + z;
+  return toAddress(Eigen::Vector3i(x, y, z));
 }
 
 inline void GridMap::boundIndex(Eigen::Vector3i& id) {
